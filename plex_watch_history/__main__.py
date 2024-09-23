@@ -46,7 +46,7 @@ def community_query(account, params):
             print(json.dumps(response, indent=4))
         return response
     except Exception as e:
-        print(f"Error while making community query: {e}")
+        print(f"Error while making community query with params {params}: {e}")
         return None
 
 
@@ -65,9 +65,14 @@ def get_watch_history(account, first=100, after=None, user_state=False, all_=Tru
     while True:
         try:
             response = community_query(account, params)
-            if response is None or 'data' not in response or 'user' not in response['data']:
-                print("Failed to get valid response")
+            if response is None:
+                print("Failed to get valid response from community_query")
                 return
+            
+            if 'data' not in response or 'user' not in response['data']:
+                print(f"Invalid response structure: {response}")
+                return
+            
             watch_history = response["data"]["user"]["watchHistory"]
             page_info = watch_history["pageInfo"]
 
@@ -100,13 +105,13 @@ def remove_watch_history(account, item):
     response = community_query(account, params)
     
     if response is None:
-        print("Failed to get a valid response from community_query")
+        print(f"Failed to get a valid response from community_query for item {item}")
         return None
     
     if "data" in response and "removeActivity" in response["data"]:
         return response["data"]["removeActivity"]
     else:
-        print("Unexpected response format:", response)
+        print(f"Unexpected response format or missing data for item {item}: {response}")
         return None
 
 
@@ -138,15 +143,19 @@ def delete_watch_history(account):
                     result = remove_watch_history(account, entry)
 
                     if result is None:
-                        print(f"Failed to remove entry with id: {entry['id']}")
+                        print(f"Failed to remove entry with id: {entry['id']}, entry data: {entry}")
                         break
 
                     # Try to avoid API rate limiting
                     time.sleep(1)
                     break
 
-                except BadRequest:
+                except BadRequest as e:
+                    print(f"BadRequest error on entry {entry['id']}: {e}")
                     time.sleep(30)
+                except Exception as e:
+                    print(f"Unexpected error on entry {entry['id']}: {e}")
+                    break
 
 
 def main():
