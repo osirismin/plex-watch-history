@@ -1,4 +1,134 @@
-": GET_WATCH_HISTORY_QUERY,
+import argparse
+import datetime
+import os
+import textwrap
+import time
+
+from plexapi import CONFIG
+from plexapi.exceptions import BadRequest
+from plexapi.myplex import MyPlexAccount
+from plexapi.utils import getMyPlexAccount
+
+COMMUNITY = "https://community.plex.tv/api"
+
+GET_WATCH_HISTORY_QUERY = """\
+query GetWatchHistoryHub(
+  $uuid: ID = ""
+  $first: PaginationInt!
+  $after: String
+  $skipUserState: Boolean = false
+) {
+  user(id: $uuid) {
+    watchHistory(first: $first, after: $after) {
+      nodes {
+        metadataItem {
+          ...itemFields
+        }
+        date
+        id
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        endCursor
+      }
+    }
+  }
+}
+
+fragment itemFields on MetadataItem {
+  id
+  images {
+    coverArt
+    coverPoster
+    thumbnail
+    art
+  }
+  userState @skip(if: $skipUserState) {
+    viewCount
+    viewedLeafCount
+    watchlistedAt
+  }
+  title
+  key
+  type
+  index
+  publicPagesURL
+  parent {
+    ...parentFields
+  }
+  grandparent {
+    ...parentFields
+  }
+  publishedAt
+  leafCount
+  year
+  originallyAvailableAt
+  childCount
+}
+
+fragment parentFields on MetadataItem {
+  index
+  title
+  publishedAt
+  key
+  type
+  images {
+    coverArt
+    coverPoster
+    thumbnail
+    art
+  }
+  userState @skip(if: $skipUserState) {
+    viewCount
+    viewedLeafCount
+    watchlistedAt
+  }
+}
+"""
+
+REMOVE_WATCH_HISTORY_QUERY = """\
+mutation removeActivity($input: RemoveActivityInput!) {
+  removeActivity(input: $input)
+}
+"""
+
+def plex_format(item):
+    item_type = item["type"].lower()
+    parent = item.get("parent", {})
+    grandparent = item.get("grandparent", {})
+
+    if item_type == "season":
+        return f"{parent.get('title', 'Unknown')}: Season {item['index']}"
+
+    if item_type == "episode":
+        return (
+            f"{grandparent.get('title', 'Unknown')}: Season {parent.get('index')}: "
+            f"Episode {item['index']:2d} - {item['title']}"
+        )
+
+    return f"{item['title']} ({item['year']})"
+
+def community_query(account, params, retries=3, delay=5):
+    """Makes a community query with retry logic."""
+    for attempt in range(retries):
+        try:
+            response = account.query(
+                COMMUNITY,
+                json=params,
+                method=account._session.post,
+                headers={"Content-Type": "application/json"},
+            )
+            if response:
+                return response
+        except Exception as e:
+            print(f"Error querying the community API (attempt {attempt + 1}/{retries}): {e}")
+        time.sleep(delay)
+    return None
+
+def get_watch_history(account, first=100, after=None, user_state=False, all_=True):
+    params = {
+        "query": GET_WATCH_HISTORY_QUERY,
         "operationName": "GetWatchHistoryHub",
         "variables": {
             "uuid": account.uuid,
