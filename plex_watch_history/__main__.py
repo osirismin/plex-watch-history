@@ -1,88 +1,44 @@
 import argparse
 import datetime
-import os
-import textwrap
 import time
-
+import textwrap
 from plexapi import CONFIG
-from plexapi.exceptions import BadRequest
 from plexapi.myplex import MyPlexAccount
 from plexapi.utils import getMyPlexAccount
+from plexapi.exceptions import BadRequest
 
-COMMUNITY = "https://community.plex.tv/api"
+COMMUNITY_API_URL = "https://community.plex.tv/api"
 
 GET_WATCH_HISTORY_QUERY = """\
 query GetWatchHistoryHub(
   $uuid: ID = ""
   $first: PaginationInt!
   $after: String
-  $skipUserState: Boolean = false
 ) {
   user(id: $uuid) {
     watchHistory(first: $first, after: $after) {
       nodes {
         metadataItem {
-          ...itemFields
+          id
+          title
+          type
+          year
+          parent {
+            title
+            index
+          }
+          grandparent {
+            title
+          }
         }
         date
         id
       }
       pageInfo {
         hasNextPage
-        hasPreviousPage
         endCursor
       }
     }
-  }
-}
-
-fragment itemFields on MetadataItem {
-  id
-  images {
-    coverArt
-    coverPoster
-    thumbnail
-    art
-  }
-  userState @skip(if: $skipUserState) {
-    viewCount
-    viewedLeafCount
-    watchlistedAt
-  }
-  title
-  key
-  type
-  index
-  publicPagesURL
-  parent {
-    ...parentFields
-  }
-  grandparent {
-    ...parentFields
-  }
-  publishedAt
-  leafCount
-  year
-  originallyAvailableAt
-  childCount
-}
-
-fragment parentFields on MetadataItem {
-  index
-  title
-  publishedAt
-  key
-  type
-  images {
-    coverArt
-    coverPoster
-    thumbnail
-    art
-  }
-  userState @skip(if: $skipUserState) {
-    viewCount
-    viewedLeafCount
-    watchlistedAt
   }
 }
 """
@@ -93,162 +49,166 @@ mutation removeActivity($input: RemoveActivityInput!) {
 }
 """
 
-def plex_format(item):
-    item_type = item["type"].lower()
-    parent = item.get("parent", {})
-    grandparent = item.get("grandparent", {})
+# ---------------------------------------------
+# Helper functions for interacting with Plex API
+# ---------------------------------------------
 
-    if item_type == "season":
-        return f"{parent.get('title', 'Unknown')}: Season {item['index']}"
-
-    if item_type == "episode":
-        return (
-            f"{grandparent.get('title', 'Unknown')}: Season {parent.get('index')}: "
-            f"Episode {item['index']:2d} - {item['title']}"
-        )
-
-    return f"{item['title']} ({item['year']})"
-
-def community_query(account, params, retries=3, delay=5):
-    """Makes a community query with retry logic."""
+def query_plex_api(account, query, variables, retries=3, delay=5):
+    """Helper to interact with Plex community API with retries."""
+    params = {
+        "query": query,
+        "variables": variables
+    }
     for attempt in range(retries):
         try:
             response = account.query(
-                COMMUNITY,
+                COMMUNITY_API_URL,
                 json=params,
                 method=account._session.post,
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json"}
             )
             if response:
                 return response
         except Exception as e:
-            print(f"Error querying the community API (attempt {attempt + 1}/{retries}): {e}")
-        time.sleep(delay)
+            print(f"Error querying API (Attempt {attempt+1}/{retries}): {e}")
+            time.sleep(delay)
     return None
 
-def get_watch_history(account, first=100, after=None, user_state=False, all_=True):
-    params = {
-        "query": GET_WATCH_HISTORY_QUERY,
-        "operationName": "GetWatchHistoryHub",
-        "variables": {
-            "uuid": account.uuid,
-            "first": first,
-            "after": after,
-            "skipUserState": not user_state,
-        },
+# ---------------------------------------------
+# Core functions for Plex watch history management
+# ---------------------------------------------
+
+def get_watch_history(account, first=100, after=None):
+    """Generator to fetch watch history from Plex API."""
+    variables = {
+        "uuid": account.uuid,
+        "first": first,
+        "after": after
     }
 
     while True:
-        response = community_query(account, params)
+        response = query_plex_api(account, GET_WATCH_HISTORY_QUERY, variables)
         if not response:
-            print("Failed to retrieve watch history after retries.")
-            break
-        watch_history = response["data"]["user"]["watchHistory"]
-        page_info = watch_history["pageInfo"]
-
-        yield from watch_history["nodes"]
-
-        if not all_ or not page_info["hasNextPage"]:
+            print("Failed to retrieve watch history.")
             return
 
-        params["variables"]["after"] = page_info["endCursor"]
+        watch_history = response["data"]["user"]["watchHistory"]
+        for node in watch_history["nodes"]:
+            yield node
 
-        time.sleep(2)  # API rate limiting
-
-def remove_watch_history(account, item, retries=3):
-    params = {
-        "query": REMOVE_WATCH_HISTORY_QUERY,
-        "operationName": "removeActivity",
-        "variables": {
-            "input": {
-                "id": item["id"],
-                "type": "WATCH_HISTORY",
-            },
-        },
-    }
-
-    for attempt in range(retries):
-        response = community_query(account, params)
-        if response is None:
-            print(f"Attempt {attempt + 1}/{retries}: Failed to remove watch history for item ID {item['id']}. Retrying...")
-            time.sleep(5)  # Delay before retrying
-        elif "data" in response and "removeActivity" in response["data"]:
-            return response["data"]["removeActivity"]
-        else:
-            print(f"Invalid response structure for item ID {item['id']}. Retrying...")
-    print(f"Failed to remove watch history for item ID {item['id']} after {retries} attempts.")
-    return False
-
-def plex_format_entry(entry):
-    date = datetime.datetime.fromisoformat(entry["date"]).strftime("%c")
-    entry = plex_format(entry["metadataItem"])
-    return f"{date}: {entry}"
-
-def list_watch_history(account):
-    for entry in get_watch_history(account):
-        print(plex_format_entry(entry))
-
-def delete_watch_history(account):
-    while True:
-        history = list(get_watch_history(account))
-        if not history:
-            print("No more watch history to delete.")
+        if not watch_history["pageInfo"]["hasNextPage"]:
             break
 
-        print(f"Deleting {len(history)} watch history entries\n")
-        for entry in history:
-            print(plex_format_entry(entry))
-            remove_watch_history(account, entry)
+        variables["after"] = watch_history["pageInfo"]["endCursor"]
+        time.sleep(2)  # Avoid API rate limiting
 
-def add_common_arguments(subparser):
-    subparser.add_argument(
-        "--token",
-        help="Your Plex token",
-        default=CONFIG.get("auth.server_token"),
-    )
-    subparser.add_argument(
-        "--username",
-        help="Your Plex username",
-        default=CONFIG.get("auth.myplex_username"),
-    )
-    subparser.add_argument(
-        "--password",
-        help="Your Plex password",
-        default=CONFIG.get("auth.myplex_password"),
-    )
+def remove_watch_history(account, entry_id):
+    """Remove a single watch history entry."""
+    variables = {
+        "input": {
+            "id": entry_id,
+            "type": "WATCH_HISTORY"
+        }
+    }
+    response = query_plex_api(account, REMOVE_WATCH_HISTORY_QUERY, variables)
+    if response and "data" in response and response["data"]["removeActivity"]:
+        return True
+    return False
+
+def delete_all_watch_history(account):
+    """Delete all Plex watch history in batches."""
+    for entry in get_watch_history(account):
+        formatted_entry = format_watch_history_entry(entry)
+        print(f"Deleting: {formatted_entry}")
+        
+        success = remove_watch_history(account, entry["id"])
+        if success:
+            print(f"Successfully deleted: {formatted_entry}")
+        else:
+            print(f"Failed to delete: {formatted_entry}")
+
+        time.sleep(1)  # Rate limit to avoid overwhelming API
+
+# ---------------------------------------------
+# Formatting utilities
+# ---------------------------------------------
+
+def format_watch_history_entry(entry):
+    """Format a watch history entry for display."""
+    date_str = datetime.datetime.fromisoformat(entry["date"]).strftime("%Y-%m-%d %H:%M:%S")
+    title = entry["metadataItem"]["title"]
+    entry_type = entry["metadataItem"]["type"]
+    year = entry["metadataItem"].get("year", "Unknown Year")
+
+    parent_title = entry["metadataItem"].get("parent", {}).get("title")
+    grandparent_title = entry["metadataItem"].get("grandparent", {}).get("title")
+
+    if entry_type == "episode":
+        return f"{date_str} - {grandparent_title}: {parent_title} - {title} ({year})"
+    elif entry_type == "movie":
+        return f"{date_str} - {title} ({year})"
+    else:
+        return f"{date_str} - {title} ({entry_type})"
+
+# ---------------------------------------------
+# CLI and entry point
+# ---------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
         description=textwrap.dedent("""
             Manage your Plex watch history.
-
-            Note: This works with the watch history that is synced to your Plex account."""),
+            
+            This script allows you to list or delete your Plex watch history entries.
+        """),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(required=True)
 
+    # List command
     parser_list = subparsers.add_parser(
-        "list",
-        help="Display all your watched movies and shows, along with the date you watched them.",
+        "list", 
+        help="List your Plex watch history."
     )
     parser_list.set_defaults(func=list_watch_history)
 
+    # Delete command
     parser_delete = subparsers.add_parser(
         "delete",
-        help="Permanently delete your entire watch history.",
+        help="Delete all your Plex watch history."
     )
-    parser_delete.set_defaults(func=delete_watch_history)
+    parser_delete.set_defaults(func=delete_all_watch_history)
 
-    for subparser in (parser_list, parser_delete):
-        add_common_arguments(subparser)
+    for subparser in [parser_list, parser_delete]:
+        subparser.add_argument(
+            "--token",
+            help="Your Plex token",
+            default=CONFIG.get("auth.server_token")
+        )
+        subparser.add_argument(
+            "--username",
+            help="Your Plex username",
+            default=CONFIG.get("auth.myplex_username")
+        )
+        subparser.add_argument(
+            "--password",
+            help="Your Plex password",
+            default=CONFIG.get("auth.myplex_password")
+        )
 
     args = parser.parse_args()
 
+    # Authentication
     if bool(args.username) != bool(args.password):
-        parser.error("both username and password must be given together")
-
+        parser.error("You must provide both username and password, or neither.")
+    
     account = MyPlexAccount(token=args.token) if args.token else getMyPlexAccount(args)
     args.func(account)
+
+def list_watch_history(account):
+    """List Plex watch history in a readable format."""
+    for entry in get_watch_history(account):
+        print(format_watch_history_entry(entry))
 
 if __name__ == "__main__":
     main()
