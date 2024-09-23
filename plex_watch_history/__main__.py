@@ -1,109 +1,176 @@
-import time
+import argparse
 import datetime
-from plexapi.exceptions import BadRequest
+import os
+import textwrap
+import time
+import logging
+import requests
 
-COMMUNITY_API_URL = "https://community.plex.tv/api"
+from plexapi import CONFIG
+from plexapi.exceptions import BadRequest, Unauthorized
+from plexapi.myplex import MyPlexAccount
+from plexapi.utils import getMyPlexAccount
 
-REMOVE_WATCH_HISTORY_QUERY = """\
-mutation removeActivity($input: RemoveActivityInput!) {
-  removeActivity(input: $input)
-}
-"""
+COMMUNITY = "https://community.plex.tv/api"
 
-# Helper function to format watch history entry for output
-def format_watch_history_entry(entry):
-    """Format watch history entry with date and title."""
-    date = datetime.datetime.fromisoformat(entry["date"]).strftime("%c")
-    title = entry["metadataItem"]["title"]
-    return f"{date}: {title}"
+GET_WATCH_HISTORY_QUERY = """\ (省略不变)"""
+REMOVE_WATCH_HISTORY_QUERY = """\ (省略不变)"""
 
-# Query Plex API with retry mechanism
-def query_plex_api(account, query, variables, retries=10, delay=5):
-    """Helper to interact with Plex community API with retries."""
-    params = {
-        "query": query,
-        "variables": variables
-    }
+# 设置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def plex_format(item):
+    item_type = item["type"].lower()
+    parent = item.get("parent")
+    grandparent = item.get("grandparent")
+
+    if item_type == "season":
+        return f"{parent['title']}: Season {item['index']}"
+    if item_type == "episode":
+        return f"{grandparent['title']}: Season {parent['index']}: Episode {item['index']:2d} - {item['title']}"
+    return f"{item['title']} ({item['year']})"
+
+def community_query(account, params, retries=3):
+    """执行社区 API 查询并增加重试机制"""
     for attempt in range(retries):
         try:
             response = account.query(
-                COMMUNITY_API_URL,
+                COMMUNITY,
                 json=params,
                 method=account._session.post,
-                headers={"Content-Type": "application/json"}
+                headers={"Content-Type": "application/json"},
             )
-            if response:
-                return response
-        except Exception as e:
-            print(f"Error querying API (Attempt {attempt+1}/{retries}): {e}")
-            time.sleep(delay)
-    return None
+            return response
+        except (requests.exceptions.RequestException, BadRequest) as e:
+            logging.warning(f"API 请求失败: {e}, 尝试重试 {attempt + 1}/{retries}")
+            time.sleep(2 ** attempt)  # 指数退避策略
+        except Unauthorized as e:
+            logging.error("认证失败，请检查你的 Plex token 或账户信息")
+            raise
+    raise Exception("多次尝试后 API 请求仍然失败")
 
-# Function to remove a single watch history entry with retries
-def remove_watch_history(account, entry_id, retries=10, delay=5):
-    """Remove a single watch history entry with retries if it fails."""
-    variables = {
-        "input": {
-            "id": entry_id,
-            "type": "WATCH_HISTORY"
-        }
+def get_watch_history(account, first=100, after=None, user_state=False, all_=True):
+    params = {
+        "query": GET_WATCH_HISTORY_QUERY,
+        "operationName": "GetWatchHistoryHub",
+        "variables": {
+            "uuid": account.uuid,
+            "first": first,
+            "after": after,
+            "skipUserState": not user_state,
+        },
     }
+    while True:
+        try:
+            response = community_query(account, params)
+            watch_history = response.get("data", {}).get("user", {}).get("watchHistory", {})
+            nodes = watch_history.get("nodes", [])
+            page_info = watch_history.get("pageInfo", {})
 
-    for attempt in range(retries):
-        print(f"Attempt {attempt+1}/{retries} to delete entry ID {entry_id}...")
-        response = query_plex_api(account, REMOVE_WATCH_HISTORY_QUERY, variables)
-        
-        # Error handling for NoneType and unexpected responses
-        if response is None:
-            print(f"API returned None for entry ID {entry_id}. Retrying...")
-        elif "data" in response and "removeActivity" in response["data"]:
-            if response["data"]["removeActivity"]:
-                print(f"Successfully deleted entry ID {entry_id}")
-                return True
-            else:
-                print(f"API responded but deletion failed for entry ID {entry_id}. Retrying...")
-        else:
-            print(f"Unexpected API response format for entry ID {entry_id}: {response}. Retrying...")
-        
-        time.sleep(delay)  # Delay before the next attempt
-    
-    print(f"Failed to delete entry ID {entry_id} after {retries} attempts. Skipping.")
-    return False
+            yield from nodes
 
-# Function to delete all watch history with retry mechanism for failures
-def delete_all_watch_history(account, retries=10, delay=5):
-    """Delete all Plex watch history with retry mechanism for failures."""
-    watch_history = get_watch_history(account)  # Assuming this is a generator or iterable
-    for entry in watch_history:
-        formatted_entry = format_watch_history_entry(entry)
-        print(f"Attempting to delete: {formatted_entry}")
-        
-        success = remove_watch_history(account, entry["id"], retries=retries, delay=delay)
-        if not success:
-            print(f"Skipping failed entry: {formatted_entry}")
+            if not all_ or not page_info.get("hasNextPage"):
+                break
 
-        time.sleep(1)  # Rate limit to avoid overwhelming API
+            params["variables"]["after"] = page_info.get("endCursor", None)
+            time.sleep(2)  # 控制 API 调用频率
 
-# Assuming get_watch_history function is defined elsewhere
-def get_watch_history(account, first=100, after=None):
-    """
-    Example function to get watch history from Plex account.
-    Replace this function with the actual logic to fetch watch history.
-    """
-    # Example watch history, replace this with the actual API call.
-    return [
-        {"id": "1", "date": "2023-09-01T12:34:56", "metadataItem": {"title": "Movie A"}},
-        {"id": "2", "date": "2023-09-02T13:45:12", "metadataItem": {"title": "Movie B"}},
-        # More entries...
-    ]
+        except Exception as e:
+            logging.error(f"获取观看历史时出错: {e}")
+            time.sleep(30)
+
+def remove_watch_history(account, item):
+    params = {
+        "query": REMOVE_WATCH_HISTORY_QUERY,
+        "operationName": "removeActivity",
+        "variables": {
+            "input": {
+                "id": item["id"],
+                "type": "WATCH_HISTORY",
+            },
+        },
+    }
+    try:
+        response = community_query(account, params)
+        return response.get("data", {}).get("removeActivity")
+    except Exception as e:
+        logging.error(f"删除观看历史时出错: {e}")
+        raise
+
+def plex_format_entry(entry):
+    date = datetime.datetime.fromisoformat(entry["date"]).strftime("%c")
+    formatted_entry = plex_format(entry["metadataItem"])
+    return f"{date}: {formatted_entry}"
+
+def list_watch_history(account):
+    logging.info("开始列出观看历史")
+    for entry in get_watch_history(account):
+        print(plex_format_entry(entry))
+
+def delete_watch_history(account):
+    logging.info("开始删除观看历史")
+    while True:
+        history = list(get_watch_history(account))
+        if not history:
+            logging.info("观看历史已全部删除")
+            break
+
+        logging.info(f"正在删除 {len(history)} 条观看历史")
+        for entry in history:
+            print(plex_format_entry(entry))
+
+            while True:
+                try:
+                    remove_watch_history(account, entry)
+                    time.sleep(1)
+                    break
+                except Exception as e:
+                    logging.warning(f"删除观看历史出错: {e}, 重试中...")
+                    time.sleep(30)
 
 def main():
-    """Main function to run the script."""
-    # Assuming you handle arguments like token, username, password in actual implementation
-    account = None  # Get the Plex account object (MyPlexAccount)
-    
-    # Example: Deleting all watch history
-    delete_all_watch_history(account, retries=10, delay=5)
+    parser = argparse.ArgumentParser(
+        description=textwrap.dedent("""
+            Manage your Plex watch history.
+
+            Note: This works with the watch history that is synced to your Plex account."""),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(required=True)
+
+    parser_list = subparsers.add_parser(
+        "list",
+        help="Display all your watched movies and shows, along with the date you watched them.",
+        description="Display all your watched movies and shows, along with the date you watched them.",
+    )
+    parser_list.set_defaults(func=list_watch_history)
+
+    parser_delete = subparsers.add_parser(
+        "delete",
+        help="Permanently delete your entire watch history.",
+        description="Permanently delete your entire watch history.",
+    )
+    parser_delete.set_defaults(func=delete_watch_history)
+
+    for subparser in (parser_list, parser_delete):
+        subparser.add_argument("--token", help="Your Plex token", default=CONFIG.get("auth.server_token"))
+        subparser.add_argument("--username", help="Your Plex username", default=CONFIG.get("auth.myplex_username"))
+        subparser.add_argument("--password", help="Your Plex password", default=CONFIG.get("auth.myplex_password"))
+
+    args = parser.parse_args()
+
+    if bool(args.username) != bool(args.password):
+        parser.error("both username and password must be given together")
+
+    try:
+        if args.token:
+            account = MyPlexAccount(token=args.token)
+        else:
+            account = getMyPlexAccount(args)
+        
+        args.func(account)
+    except Exception as e:
+        logging.error(f"程序执行时出错: {e}")
 
 if __name__ == "__main__":
     main()
