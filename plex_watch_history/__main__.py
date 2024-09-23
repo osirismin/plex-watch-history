@@ -12,87 +12,8 @@ from plexapi.utils import getMyPlexAccount
 
 COMMUNITY = "https://community.plex.tv/api"
 
-GET_WATCH_HISTORY_QUERY = """\
-query GetWatchHistoryHub(
-  $uuid: ID = ""
-  $first: PaginationInt!
-  $after: String
-  $skipUserState: Boolean = false
-) {
-  user(id: $uuid) {
-    watchHistory(first: $first, after: $after) {
-      nodes {
-        metadataItem {
-          ...itemFields
-        }
-        date
-        id
-      }
-      pageInfo {
-        hasNextPage
-        hasPreviousPage
-        endCursor
-      }
-    }
-  }
-}
-
-fragment itemFields on MetadataItem {
-  id
-  images {
-    coverArt
-    coverPoster
-    thumbnail
-    art
-  }
-  userState @skip(if: $skipUserState) {
-    viewCount
-    viewedLeafCount
-    watchlistedAt
-  }
-  title
-  key
-  type
-  index
-  publicPagesURL
-  parent {
-    ...parentFields
-  }
-  grandparent {
-    ...parentFields
-  }
-  publishedAt
-  leafCount
-  year
-  originallyAvailableAt
-  childCount
-}
-
-fragment parentFields on MetadataItem {
-  index
-  title
-  publishedAt
-  key
-  type
-  images {
-    coverArt
-    coverPoster
-    thumbnail
-    art
-  }
-  userState @skip(if: $skipUserState) {
-    viewCount
-    viewedLeafCount
-    watchlistedAt
-  }
-}
-"""
-
-REMOVE_WATCH_HISTORY_QUERY = """\
-mutation removeActivity($input: RemoveActivityInput!) {
-  removeActivity(input: $input)
-}
-"""
+GET_WATCH_HISTORY_QUERY = """..."""  # 省略长字符串
+REMOVE_WATCH_HISTORY_QUERY = """..."""  # 省略长字符串
 
 
 def plex_format(item):
@@ -113,19 +34,20 @@ def plex_format(item):
 
 
 def community_query(account, params):
-    response = account.query(
-        COMMUNITY,
-        json=params,
-        method=account._session.post,
-        headers={"Content-Type": "application/json"},
-    )
-
-    if False:
-        import json
-
-        print(json.dumps(response, indent=4))
-
-    return response
+    try:
+        response = account.query(
+            COMMUNITY,
+            json=params,
+            method=account._session.post,
+            headers={"Content-Type": "application/json"},
+        )
+        if False:  # 这里是调试代码，可以考虑打开调试信息以打印响应内容
+            import json
+            print(json.dumps(response, indent=4))
+        return response
+    except Exception as e:
+        print(f"Error while making community query: {e}")
+        return None
 
 
 def get_watch_history(account, first=100, after=None, user_state=False, all_=True):
@@ -143,6 +65,9 @@ def get_watch_history(account, first=100, after=None, user_state=False, all_=Tru
     while True:
         try:
             response = community_query(account, params)
+            if response is None or 'data' not in response or 'user' not in response['data']:
+                print("Failed to get valid response")
+                return
             watch_history = response["data"]["user"]["watchHistory"]
             page_info = watch_history["pageInfo"]
 
@@ -173,7 +98,16 @@ def remove_watch_history(account, item):
     }
 
     response = community_query(account, params)
-    return response["data"]["removeActivity"]
+    
+    if response is None:
+        print("Failed to get a valid response from community_query")
+        return None
+    
+    if "data" in response and "removeActivity" in response["data"]:
+        return response["data"]["removeActivity"]
+    else:
+        print("Unexpected response format:", response)
+        return None
 
 
 def plex_format_entry(entry):
@@ -201,7 +135,11 @@ def delete_watch_history(account):
 
             while True:
                 try:
-                    remove_watch_history(account, entry)
+                    result = remove_watch_history(account, entry)
+
+                    if result is None:
+                        print(f"Failed to remove entry with id: {entry['id']}")
+                        break
 
                     # Try to avoid API rate limiting
                     time.sleep(1)
@@ -212,6 +150,7 @@ def delete_watch_history(account):
 
 
 def main():
+    # 配置参数解析器
     parser = argparse.ArgumentParser(
         description=textwrap.dedent("""
             Manage your Plex watch history.
@@ -219,8 +158,10 @@ def main():
             Note: This works with the watch history that is synced to your Plex account."""),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    
     subparsers = parser.add_subparsers(required=True)
 
+    # "list" 子命令
     parser_list = subparsers.add_parser(
         "list",
         help="Display all your watched movies and shows, along with the date you watched them.",
@@ -228,6 +169,7 @@ def main():
     )
     parser_list.set_defaults(func=list_watch_history)
 
+    # "delete" 子命令
     parser_delete = subparsers.add_parser(
         "delete",
         help="Permanently delete your entire watch history.",
@@ -235,13 +177,13 @@ def main():
     )
     parser_delete.set_defaults(func=delete_watch_history)
 
+    # 为两个子命令添加通用参数
     for subparser in (parser_list, parser_delete):
         subparser.add_argument(
             "--token",
             help="Your Plex token",
             default=CONFIG.get("auth.server_token"),
         )
-
         subparser.add_argument(
             "--username",
             help="Your Plex username",
@@ -260,7 +202,6 @@ def main():
 
     if args.token:
         account = MyPlexAccount(token=args.token)
-
     else:
         account = getMyPlexAccount(args)
 
