@@ -4,7 +4,6 @@ import os
 import textwrap
 import time
 import logging
-import requests
 
 from plexapi import CONFIG
 from plexapi.exceptions import BadRequest, Unauthorized
@@ -13,41 +12,52 @@ from plexapi.utils import getMyPlexAccount
 
 COMMUNITY = "https://community.plex.tv/api"
 
-GET_WATCH_HISTORY_QUERY = """\ (省略不变)"""
-REMOVE_WATCH_HISTORY_QUERY = """\ (省略不变)"""
+GET_WATCH_HISTORY_QUERY = """\
+# (省略了之前的查询部分...)
+"""
 
-# 设置日志
+REMOVE_WATCH_HISTORY_QUERY = """\
+# (省略了之前的查询部分...)
+"""
+
+# 设置日志记录
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def plex_format(item):
     item_type = item["type"].lower()
-    parent = item.get("parent")
-    grandparent = item.get("grandparent")
+    parent = item["parent"]
+    grandparent = item["grandparent"]
 
     if item_type == "season":
         return f"{parent['title']}: Season {item['index']}"
     if item_type == "episode":
-        return f"{grandparent['title']}: Season {parent['index']}: Episode {item['index']:2d} - {item['title']}"
+        return (
+            f"{grandparent['title']}: Season {parent['index']}: "
+            f"Episode {item['index']:2d} - {item['title']}"
+        )
     return f"{item['title']} ({item['year']})"
 
-def community_query(account, params, retries=3):
-    """执行社区 API 查询并增加重试机制"""
-    for attempt in range(retries):
-        try:
-            response = account.query(
-                COMMUNITY,
-                json=params,
-                method=account._session.post,
-                headers={"Content-Type": "application/json"},
-            )
-            return response
-        except (requests.exceptions.RequestException, BadRequest) as e:
-            logging.warning(f"API 请求失败: {e}, 尝试重试 {attempt + 1}/{retries}")
-            time.sleep(2 ** attempt)  # 指数退避策略
-        except Unauthorized as e:
-            logging.error("认证失败，请检查你的 Plex token 或账户信息")
-            raise
-    raise Exception("多次尝试后 API 请求仍然失败")
+def community_query(account, params):
+    try:
+        response = account.query(
+            COMMUNITY,
+            json=params,
+            method=account._session.post,
+            headers={"Content-Type": "application/json"},
+        )
+        return response
+    except BadRequest as e:
+        logging.error(f"BadRequest error: {e}")
+        raise
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        raise
+
+def exponential_backoff(retries, max_wait=60):
+    """指数退避策略"""
+    wait_time = min(2 ** retries, max_wait)
+    logging.info(f"Retrying in {wait_time} seconds...")
+    time.sleep(wait_time)
 
 def get_watch_history(account, first=100, after=None, user_state=False, all_=True):
     params = {
@@ -60,24 +70,25 @@ def get_watch_history(account, first=100, after=None, user_state=False, all_=Tru
             "skipUserState": not user_state,
         },
     }
+    retries = 0
     while True:
         try:
             response = community_query(account, params)
-            watch_history = response.get("data", {}).get("user", {}).get("watchHistory", {})
-            nodes = watch_history.get("nodes", [])
-            page_info = watch_history.get("pageInfo", {})
+            watch_history = response["data"]["user"]["watchHistory"]
+            page_info = watch_history["pageInfo"]
+            yield from watch_history["nodes"]
 
-            yield from nodes
-
-            if not all_ or not page_info.get("hasNextPage"):
+            if not all_ or not page_info["hasNextPage"]:
+                return
+            params["variables"]["after"] = page_info["endCursor"]
+            time.sleep(2)  # 正常情况的等待时间，避免速率限制
+        except BadRequest:
+            if retries < 5:
+                retries += 1
+                exponential_backoff(retries)
+            else:
+                logging.error("Max retries reached, aborting.")
                 break
-
-            params["variables"]["after"] = page_info.get("endCursor", None)
-            time.sleep(2)  # 控制 API 调用频率
-
-        except Exception as e:
-            logging.error(f"获取观看历史时出错: {e}")
-            time.sleep(30)
 
 def remove_watch_history(account, item):
     params = {
@@ -90,43 +101,41 @@ def remove_watch_history(account, item):
             },
         },
     }
-    try:
-        response = community_query(account, params)
-        return response.get("data", {}).get("removeActivity")
-    except Exception as e:
-        logging.error(f"删除观看历史时出错: {e}")
-        raise
+    retries = 0
+    while retries < 5:
+        try:
+            response = community_query(account, params)
+            return response["data"]["removeActivity"]
+        except BadRequest:
+            retries += 1
+            exponential_backoff(retries)
 
 def plex_format_entry(entry):
     date = datetime.datetime.fromisoformat(entry["date"]).strftime("%c")
-    formatted_entry = plex_format(entry["metadataItem"])
-    return f"{date}: {formatted_entry}"
+    entry = plex_format(entry["metadataItem"])
+    return f"{date}: {entry}"
 
 def list_watch_history(account):
-    logging.info("开始列出观看历史")
-    for entry in get_watch_history(account):
-        print(plex_format_entry(entry))
+    try:
+        for entry in get_watch_history(account):
+            print(plex_format_entry(entry))
+    except Exception as e:
+        logging.error(f"Error listing watch history: {e}")
 
 def delete_watch_history(account):
-    logging.info("开始删除观看历史")
     while True:
-        history = list(get_watch_history(account))
-        if not history:
-            logging.info("观看历史已全部删除")
+        try:
+            history = list(get_watch_history(account))
+            if not history:
+                break
+            print(f"Deleting {len(history)} watch history entries\n")
+            for entry in history:
+                print(plex_format_entry(entry))
+                remove_watch_history(account, entry)
+                time.sleep(1)  # 避免速率限制
+        except Exception as e:
+            logging.error(f"Error deleting watch history: {e}")
             break
-
-        logging.info(f"正在删除 {len(history)} 条观看历史")
-        for entry in history:
-            print(plex_format_entry(entry))
-
-            while True:
-                try:
-                    remove_watch_history(account, entry)
-                    time.sleep(1)
-                    break
-                except Exception as e:
-                    logging.warning(f"删除观看历史出错: {e}, 重试中...")
-                    time.sleep(30)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -141,14 +150,12 @@ def main():
     parser_list = subparsers.add_parser(
         "list",
         help="Display all your watched movies and shows, along with the date you watched them.",
-        description="Display all your watched movies and shows, along with the date you watched them.",
     )
     parser_list.set_defaults(func=list_watch_history)
 
     parser_delete = subparsers.add_parser(
         "delete",
         help="Permanently delete your entire watch history.",
-        description="Permanently delete your entire watch history.",
     )
     parser_delete.set_defaults(func=delete_watch_history)
 
@@ -163,14 +170,12 @@ def main():
         parser.error("both username and password must be given together")
 
     try:
-        if args.token:
-            account = MyPlexAccount(token=args.token)
-        else:
-            account = getMyPlexAccount(args)
-        
+        account = MyPlexAccount(token=args.token) if args.token else getMyPlexAccount(args)
         args.func(account)
+    except Unauthorized:
+        logging.error("Authentication failed, please check your credentials.")
     except Exception as e:
-        logging.error(f"程序执行时出错: {e}")
+        logging.error(f"An error occurred: {e}")
 
 if __name__ == "__main__":
     main()
