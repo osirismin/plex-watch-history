@@ -154,10 +154,10 @@ def get_watch_history(account, first=100, after=None, user_state=False, all_=Tru
             params["variables"]["after"] = page_info["endCursor"]
 
             # Try to avoid API rate limiting
-            time.sleep(2)
+            time.sleep(3)
 
         except BadRequest:
-            time.sleep(30)
+            time.sleep(40)
 
 
 def remove_watch_history(account, item):
