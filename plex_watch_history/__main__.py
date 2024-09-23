@@ -13,11 +13,85 @@ from plexapi.utils import getMyPlexAccount
 COMMUNITY = "https://community.plex.tv/api"
 
 GET_WATCH_HISTORY_QUERY = """\
-# (省略了之前的查询部分...)
+query GetWatchHistoryHub(
+  $uuid: ID = ""
+  $first: PaginationInt!
+  $after: String
+  $skipUserState: Boolean = false
+) {
+  user(id: $uuid) {
+    watchHistory(first: $first, after: $after) {
+      nodes {
+        metadataItem {
+          ...itemFields
+        }
+        date
+        id
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        endCursor
+      }
+    }
+  }
+}
+
+fragment itemFields on MetadataItem {
+  id
+  images {
+    coverArt
+    coverPoster
+    thumbnail
+    art
+  }
+  userState @skip(if: $skipUserState) {
+    viewCount
+    viewedLeafCount
+    watchlistedAt
+  }
+  title
+  key
+  type
+  index
+  publicPagesURL
+  parent {
+    ...parentFields
+  }
+  grandparent {
+    ...parentFields
+  }
+  publishedAt
+  leafCount
+  year
+  originallyAvailableAt
+  childCount
+}
+
+fragment parentFields on MetadataItem {
+  index
+  title
+  publishedAt
+  key
+  type
+  images {
+    coverArt
+    coverPoster
+    thumbnail
+    art
+  }
+  userState @skip(if: $skipUserState) {
+    viewCount
+    viewedLeafCount
+    watchlistedAt
+  }
+}
 """
 
 REMOVE_WATCH_HISTORY_QUERY = """\
-# (省略了之前的查询部分...)
+mutation removeActivity($input: RemoveActivityInput!) {
+  removeActivity(input: $input)
+}
 """
 
 # 设置日志记录
